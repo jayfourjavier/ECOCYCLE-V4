@@ -2,10 +2,99 @@
 #include <WiFi.h>
 #include <LiquidCrystal_I2C.h>
 #include <AccelStepper.h>
+#include <Adafruit_MAX31865.h>
+
+float soilWeight = 0.0;
+float foodWeight = 0.0;
+float soilLevel = 0.0;
+float foodLevel = 0.0;
+
+
 
 #define WIFI_SSID "TP-Link_DADB"
 #define WIFI_PASSWORD "24446666678"
 
+// #define WIFI_SSID "yourWifiSsid"
+// #define WIFI_PASSWORD "yourWifiPassword"
+
+/* -----------------TEMPERATURE SENSOR CONTROLLER------------------------- */
+#define THERMOMETER_CS_PIN 5
+#define RREF 430.0     // Reference resistor value in ohms
+#define RNOMINAL 100.0 // Nominal resistance of PT100 at 0°C in ohms
+
+Adafruit_MAX31865 thermometer = Adafruit_MAX31865(THERMOMETER_CS_PIN);
+
+void setupThermometer(){
+  thermometer.begin(MAX31865_3WIRE);
+}
+
+float getTemperature()
+{
+    // Read raw RTD measurement
+    uint16_t rtd = thermometer.readRTD();
+
+    // Calculate resistance
+    float ratio = static_cast<float>(rtd) / 32768.0f;
+    float resistance = RREF * ratio;
+
+    // Check sensor faults
+    uint8_t fault = thermometer.readFault();
+
+    if (fault)
+    {
+        Serial.printf("[PT100] FAULT: 0x%02X\n", fault);
+
+        if (fault & MAX31865_FAULT_HIGHTHRESH)
+            Serial.println("[PT100] RTD High Threshold");
+
+        if (fault & MAX31865_FAULT_LOWTHRESH)
+            Serial.println("[PT100] RTD Low Threshold");
+
+        if (fault & MAX31865_FAULT_REFINLOW)
+            Serial.println("[PT100] REFIN- > 0.85 x Bias");
+
+        if (fault & MAX31865_FAULT_REFINHIGH)
+            Serial.println("[PT100] REFIN- < 0.85 x Bias - FORCE- open");
+
+        if (fault & MAX31865_FAULT_RTDINLOW)
+            Serial.println("[PT100] RTDIN- < 0.85 x Bias - FORCE- open");
+
+        if (fault & MAX31865_FAULT_OVUV)
+            Serial.println("[PT100] Under/Over voltage");
+
+        thermometer.clearFault();
+
+        return NAN;
+    }
+
+    // Calculate temperature
+    float temperature = thermometer.temperature(RNOMINAL, RREF);
+
+    // Print diagnostics
+    // Serial.printf(
+    //     "[PT100] RTD: %u | RATIO: %.5f | RESISTANCE: %.2f | TEMPERATURE: %.2f C\n",
+    //     static_cast<unsigned int>(rtd),
+    //     ratio,
+    //     resistance,
+    //     temperature
+    // );
+
+    return temperature;
+}
+
+void thermometerController()
+{
+  // static unsigned long lastReadTime = 0;
+  // unsigned long currentTime = millis();
+
+  // if (currentTime - lastReadTime >= 1000)
+  // {
+  //   lastReadTime = currentTime;
+
+  //   float temperature = getTemperature();
+  //   Serial.printf("Current Temperature: %.2f °C\n", temperature);
+  // }
+}
 
 
 /* -----------------STEPPER MOTOR CONTROLLER------------------------- */
@@ -35,7 +124,8 @@ AccelStepper sensorStepper(AccelStepper::DRIVER, SENSOR_STEPPER_PULSE_PIN, SENSO
 AccelStepper mixerStepper(AccelStepper::DRIVER, MIXER_STEPPER_PULSE_PIN, MIXER_STEPPER_DIR_PIN);
 AccelStepper gateStepper(AccelStepper::DRIVER, GATE_STEPPER_PULSE_PIN, GATE_STEPPER_DIR_PIN);
 
-void setupSteppers() {
+
+void setupStepperMotors() {
   sensorStepper.setMaxSpeed(SENSOR_STEPPER_MAX_SPEED);
   sensorStepper.setAcceleration(SENSOR_STEPPER_ACCELERATION);
   sensorStepper.setCurrentPosition(0);
@@ -49,6 +139,12 @@ void setupSteppers() {
   gateStepper.setCurrentPosition(0);
 
   Serial.println("Steppers setup complete.");
+}
+
+void loopStepperMotors(){
+  sensorStepper.run();
+  mixerStepper.run();
+  gateStepper.run();
 }
 
 
@@ -101,13 +197,14 @@ void serialMonitorController(){
 
   if (currentTime - lastPrintTime >= printInterval) {
     lastPrintTime = currentTime;
-    Serial.printf("%u \t| FOOD:%d | SOIL:%d | MIXER:%d | GATE:%d | SENSOR:%d \n", 
+    Serial.printf("%u \t| FC:%d | SC:%d | MH:%d | GH:%d | SH:%d || TEMP: %.2f\n", 
       currentTime, 
       isFoodCoverClose(),
       isSoilCoverClose(),
       isMixerStepperHome(),
       isGateStepperHome(),
-      isSensorStepperHome()
+      isSensorStepperHome(), 
+      getTemperature()
     );
   }
 }
@@ -121,44 +218,48 @@ LiquidCrystal_I2C lcd(LCD_I2C_ADDRESS, LCD_COLUMNS, LCD_ROWS);
 
 /**
  * @brief Updates the LCD with food and soil hopper levels.
- * @details Displays two-digit percentage values without decimals.
- * @note Values are truncated to integers and padded with leading zeros.
+ * @details Displays three-character integer percentages without decimals.
+ * @note Values are padded with leading spaces instead of zeros.
  */
-void lcdUpdateHopperLevel(float foodLevel, float soilLevel) {
+void lcdUpdateHopperLevel(float foodLevel, float soilLevel)
+{
     static bool firstRun = false;
 
-    if (!firstRun) {
-        lcd.setCursor(0, 2);
-        lcd.print("FOOD LVL: 00% SOIL:00%");
+    if (!firstRun)
+    {
+        lcd.setCursor(0, 1);
+        lcd.print("FOOD:   % SOIL:   %");
         firstRun = true;
     }
 
-    lcd.setCursor(10, 2);
-    lcd.printf("%02d", (int)foodLevel);
+    lcd.setCursor(5, 1);
+    lcd.printf("%3d", (int)foodLevel);
 
-    lcd.setCursor(18, 2);
-    lcd.printf("%02d", (int)soilLevel);
+    lcd.setCursor(15, 1);
+    lcd.printf("%3d", (int)soilLevel);
 }
 
 /**
- * @brief Updates LCD with food and soil weight percentages.
- * @details Displays two-digit integer values without decimals.
- * @note Values are truncated to integers and padded with leading zeros.
+ * @brief Updates LCD with food and soil weight readings.
+ * @details Displays four-character integer weights in grams.
+ * @note Values are padded with leading spaces instead of zeros.
  */
-void lcdUpdateWeight(float foodWeight, float soilWeight) {
+void lcdUpdateWeight(float foodWeight, float soilWeight)
+{
     static bool firstRun = false;
 
-    if (!firstRun) {
-        lcd.setCursor(0, 1);
-        lcd.print("FOOD WT: 00% SOIL:00%");
+    if (!firstRun)
+    {
+        lcd.setCursor(0, 2);
+        lcd.print("FOOD:0000 SOIL:0000");
         firstRun = true;
     }
 
-    lcd.setCursor(9, 1);
-    lcd.printf("%02d", (int)foodWeight);
+    lcd.setCursor(5, 2);
+    lcd.printf("%4d", (int)foodWeight);
 
-    lcd.setCursor(18, 1);
-    lcd.printf("%02d", (int)soilWeight);
+    lcd.setCursor(15, 2);
+    lcd.printf("%4d", (int)soilWeight);
 }
 
 /**
@@ -175,7 +276,7 @@ void lcdUpdateFeedback() {
     snprintf(
         lcdFeedback,
         sizeof(lcdFeedback),
-        "FC:%c SC:%c MH:%c GH:%c SH:%c",
+        "FC%c SC%c MH%c GH%c SH%c",
         isFoodCoverClose() ? '1' : '0',
         isSoilCoverClose() ? '1' : '0',
         isMixerStepperHome() ? '1' : '0',
@@ -187,13 +288,25 @@ void lcdUpdateFeedback() {
     lcd.print(lcdFeedback);
 }
 
-void lcdController(){
-  lcd.setCursor(0, 1);
-  lcd.printf("FOOD:%d | SOIL:%d", isFoodCoverClose(), isSoilCoverClose());
-  lcd.setCursor(0, 2);
-  lcd.printf("MIXER:%d | GATE:%d | SENSOR:%d", isMixerStepperHome(), isGateStepperHome(), isSensorStepperHome());
-}
+void lcdController()
+{
+    static unsigned long lastUpdateTime = 0;
+    constexpr unsigned long UPDATE_INTERVAL = 500;
 
+    if (millis() - lastUpdateTime < UPDATE_INTERVAL)
+        return;
+
+    lastUpdateTime = millis();
+
+    // Update machine feedback
+    lcdUpdateFeedback();
+
+    // Update hopper levels
+    lcdUpdateHopperLevel(foodLevel, soilLevel);
+
+    // Update weight percentages
+    lcdUpdateWeight(foodWeight, soilWeight);
+}
 
 // SETUP
 void setup() {
@@ -205,9 +318,24 @@ void setup() {
   lcd.print("ECOCYCLE");
 
   setupMachineFeedback();
+  setupStepperMotors();
+  setupThermometer();
+}
+
+void stepperMotorController(){
+  loopStepperMotors();
 }
 
 void stateController(){
+
+}
+
+void machineController(){
+  thermometerController();
+  stepperMotorController();
+  lcdController();
+
+
 
 }
 
@@ -215,6 +343,10 @@ void loop() {
 
   serialMonitorController();
   stateController();
+  machineController();
+
+
+  
   // put your main code here, to run repeatedly:
 }
 
